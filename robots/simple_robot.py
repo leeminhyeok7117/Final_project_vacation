@@ -82,6 +82,7 @@ class SimpleRobot:
         self.motor_model = motor_model
         self.is_leader = is_leader
         self.gear_ratios = {1: 2.0, 11: 2.0}
+        # self.gear_ratios = {}
         # ====================================================================
         # 캘리브레이션 경로 설정
         # ====================================================================
