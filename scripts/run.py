@@ -17,7 +17,7 @@ from policy.act_vision_policy import ACTVisionPolicy
 # =========================================================
 # 설정
 # =========================================================
-MODEL_PATH = "examples/models/policy_epoch_1000.pth"
+MODEL_PATH = "examples/models/act_cvae_epoch_450.pth"
 JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 SEQ_LEN = 8
 CHUNK_SIZE = 4
