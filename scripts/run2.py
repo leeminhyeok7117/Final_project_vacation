@@ -70,12 +70,7 @@ class ACTInference:
         critical_missing = [k for k in missing_keys if "vae_encoder" not in k]
 
         if len(critical_missing) > 0:
-            print("\n" + "="*60)
             print("[CRITICAL ERROR] 모델의 핵심 가중치가 누락되었습니다!")
-            print("이 상태로 실행하면 로봇이 오작동(발작)합니다.")
-            print(f"누락된 핵심 키 개수: {len(critical_missing)}개")
-            print(f"예시: {critical_missing[:5]} ...")
-            print("="*60 + "\n")
             sys.exit(1) # 즉시 종료 (안전 확보)
         
         print("[INFO] 모델 가중치 로드 완료.")
@@ -204,7 +199,6 @@ def main():
             debug_raw_list = []
             for i, name in enumerate(JOINT_NAMES):
                 pred_val = float(next_action[i]) 
-                
                 raw_val = bus.denormalize(name, pred_val)
 
                 debug_raw_list.append(raw_val)
