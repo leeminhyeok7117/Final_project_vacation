@@ -105,7 +105,7 @@ class ACTVisionConfig:
     n_decoder_layers: int = 1
 
     # VAE
-    use_vae: bool = True
+    use_vae: bool = False
     latent_dim: int = 32
     n_vae_encoder_layers: int = 4
 
