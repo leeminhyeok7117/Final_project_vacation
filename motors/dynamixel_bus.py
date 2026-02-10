@@ -39,6 +39,7 @@ AX12_CTRL_TABLE = {
 X_SERIES_CTRL_TABLE = {
     "Torque_Enable": (64, 1),
     "Goal_Position": (116, 4),
+    "Profile_Velocity": (112, 4),
     "Present_Position": (132, 4),
     "Present_Velocity": (128, 4),
     "Present_Load": (126, 2),
@@ -101,11 +102,34 @@ class DynamixelMotorsBus:
     # ========================================
 
     def enable_torque(self, motor_names=None):
+        """토크 활성화 및 하드웨어 속도 제한 설정"""
+        
+        # [속도 조절] 
+        # 0: 무제한 (진동 발생함)
+        # 130: 추천값 (적당히 빠르고 부드러움)
+        SPEED_LIMIT_VAL_AX = 100 
+        SPEED_LIMIT_VAL_XL = 200
+
         target = motor_names or list(self.motors.keys())
-        for n in target:
-            m = self.motors[n]
-            h, t, _, _ = self.get_target_info(m.id)
-            h.write1ByteTxRx(self.port_handler, m.id, t["Torque_Enable"][0], 1)
+        
+        for name in target:
+            motor = self.motors[name]
+            handler, table, _, _ = self.get_target_info(motor.id)
+
+            try:
+                if motor.protocol == 1.0:
+                    # AX-12A (Protocol 1.0): 2바이트 명령 사용
+                    addr_spd, size_spd = table.get("Moving_Speed", (32, 2))
+                    handler.write2ByteTxRx(self.port_handler, motor.id, addr_spd, SPEED_LIMIT_VAL_AX)
+                else:
+                    # XL/XM (Protocol 2.0): 4바이트 명령 사용
+                    addr_spd, size_spd = table.get("Profile_Velocity", (112, 4))
+                    handler.write4ByteTxRx(self.port_handler, motor.id, addr_spd, SPEED_LIMIT_VAL_XL)
+            except Exception as e:
+                logger.warning(f"[{name}] 속도 설정 실패: {e}")
+
+            addr_tq, _ = table["Torque_Enable"]
+            handler.write1ByteTxRx(self.port_handler, motor.id, addr_tq, 1)
 
     def disable_torque(self, motor_names=None):
         target = motor_names or list(self.motors.keys())
