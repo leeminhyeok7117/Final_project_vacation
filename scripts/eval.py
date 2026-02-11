@@ -1,305 +1,186 @@
-# #!/usr/bin/env python3
-# # -*- coding: utf-8 -*-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import sys
+import time
+import torch
+import torch.nn.functional as F
+import numpy as np
+from collections import deque
+from pathlib import Path
+from torchvision import transforms
 
-# """
-# PKL 자동 구조 탐색 + 진단
-# - demo_*.pkl 내부를 재귀 탐색해서 이미지/벡터 후보를 '키 경로(path)'로 찾아냄
-# - 찾은 경로를 기반으로 RGB/BGR, state/action 범위, (가능하면) Hz까지 진단
+# =========================================================
+# 0. 경로 및 임포트 설정
+# =========================================================
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent 
 
-# 실행:
-# python3 eval.py --data_dir /home/lmh/minimal_lerobot/examples/data --pattern "demo_*.pkl" --max_files 5 --max_steps 200 --show 0
-# """
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
-# import argparse
-# import pickle
-# import glob
-# from pathlib import Path
-# import numpy as np
+from robots import SimpleRobot 
 
-# try:
-#     import cv2
-# except Exception:
-#     cv2 = None
+try:
+    from policy.act_vision_policy import ACTVisionPolicy, OBS_IMAGE, OBS_STATE
+except ImportError as e:
+    print(f"[Error] act_vision_policy.py를 찾을 수 없습니다. 에러: {e}")
+    sys.exit(1)
 
+# =========================================================
+# 1. 설정값
+# =========================================================
+MODEL_FILE_NAME = "checkpoint_epoch_200.pth"
+MODEL_PATH = project_root / "examples" / "models" / MODEL_FILE_NAME
+JOINT_NAMES = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
-# # -------------------------
-# # 재귀 탐색 유틸
-# # -------------------------
-# def walk(obj, prefix=""):
-#     """
-#     obj 내부를 재귀적으로 탐색해서 (path, value) yield
-#     path 예: root.steps[0].obs.image
-#     """
-#     yield prefix if prefix else "root", obj
+SEQ_LEN = 8
+CHUNK_SIZE = 8
+STATE_DIM = 6
+ACTION_DIM = 6
+D_MODEL = 512       
 
-#     if isinstance(obj, dict):
-#         for k, v in obj.items():
-#             p = f"{prefix}.{k}" if prefix else f"root.{k}"
-#             yield from walk(v, p)
+CONTROL_HZ = 30.0
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-#     elif isinstance(obj, (list, tuple)):
-#         for i, v in enumerate(obj):
-#             p = f"{prefix}[{i}]" if prefix else f"root[{i}]"
-#             # 너무 깊은 대형 리스트는 앞부분만 탐색
-#             if i >= 5:
-#                 break
-#             yield from walk(v, p)
+# =========================================================
+# 2. 추론 클래스 (Temporal Ensembling 통합)
+# =========================================================
+class ACTInference:
+    def __init__(self, checkpoint_path, device="cuda"):
+        self.device = device
+        print(f"[INFO] 체크포인트 로드 중: {checkpoint_path}")
+        
+        self.policy = ACTVisionPolicy(
+            state_dim=STATE_DIM, 
+            action_dim=ACTION_DIM, 
+            chunk_size=CHUNK_SIZE,
+            n_action_steps=CHUNK_SIZE,
+            d_model=D_MODEL
+        ).to(device)
 
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        self.policy.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        self.policy.eval()
 
-# def is_img_candidate(x):
-#     return (
-#         isinstance(x, np.ndarray)
-#         and x.ndim == 3
-#         and x.shape[2] == 3
-#         and x.dtype == np.uint8
-#         and x.shape[0] >= 64
-#         and x.shape[1] >= 64
-#     )
+        self.stats = checkpoint['stats']
+        self.use_min_max = "min" in self.stats
+        if not self.use_min_max and "qpos_mean" in self.stats:
+            self.stats["mean"] = self.stats["qpos_mean"]
+            self.stats["std"] = self.stats["qpos_std"]
 
+        self.img_transform = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-# def is_vec_candidate(x, dim=6):
-#     x = np.asarray(x) if isinstance(x, (list, tuple, np.ndarray)) else None
-#     if x is None:
-#         return False
-#     if not isinstance(x, np.ndarray):
-#         return False
-#     if x.dtype.kind not in ("f", "i"):
-#         return False
-#     if x.ndim == 1 and x.shape[0] == dim:
-#         return True
-#     if x.ndim == 2 and x.shape[1] == dim:
-#         return True
-#     return False
+        # Temporal Ensembling 버퍼 초기화
+        self.all_time_actions = None
+        self.step_idx = 0
+        self.k = 0.01  # 지수 가중치 (작을수록 과거 예측 중시, 클수록 최신 예측 중시)
 
+    def _normalize_state(self, state):
+        if self.use_min_max:
+            s_min = self.stats["min"].to(self.device)
+            s_max = self.stats["max"].to(self.device)
+            return 2 * (state - s_min) / (s_max - s_min + 1e-5) - 1
+        else:
+            mean = self.stats["mean"].to(self.device)
+            std = self.stats["std"].to(self.device)
+            return (state - mean) / (std + 1e-8)
 
-# def get_by_path(root, path):
-#     """
-#     walk에서 나온 path 문자열을 실제로 따라가 value를 꺼냄
-#     지원: dict key .k, list index [i]
-#     """
-#     if path == "root":
-#         return root
-#     assert path.startswith("root")
-#     cur = root
-#     rest = path[4:]  # remove "root"
-#     i = 0
-#     while i < len(rest):
-#         if rest[i] == ".":
-#             i += 1
-#             j = i
-#             while j < len(rest) and rest[j] not in ".[":
-#                 j += 1
-#             key = rest[i:j]
-#             cur = cur[key]
-#             i = j
-#         elif rest[i] == "[":
-#             i += 1
-#             j = i
-#             while j < len(rest) and rest[j] != "]":
-#                 j += 1
-#             idx = int(rest[i:j])
-#             cur = cur[idx]
-#             i = j + 1
-#         else:
-#             i += 1
-#     return cur
+    def _unnormalize_action(self, action_norm):
+        if self.use_min_max:
+            a_min = self.stats["min"].to(self.device)
+            a_max = self.stats["max"].to(self.device)
+            return (action_norm + 1) * (a_max - a_min) / 2 + a_min
+        else:
+            mean = self.stats["mean"].to(self.device)
+            std = self.stats["std"].to(self.device)
+            return action_norm * std + mean
 
+    @torch.no_grad()
+    def step(self, image_np, current_joints):
+        # 1. 전처리
+        img_t = torch.from_numpy(image_np).permute(2, 0, 1).float() / 255.0
+        img_t = F.interpolate(img_t.unsqueeze(0), size=(128, 128), mode="bilinear").squeeze(0)
+        img_t = self.img_transform(img_t).unsqueeze(0).to(self.device)
+        state_t = torch.tensor(current_joints, dtype=torch.float32).to(self.device)
+        state_norm = self._normalize_state(state_t).unsqueeze(0)
 
-# # -------------------------
-# # RGB/BGR 휴리스틱(간단)
-# # -------------------------
-# def rgb_bgr_score(img_u8):
-#     img = img_u8.astype(np.float32) / 255.0
-#     c0 = img[..., 0].mean()
-#     c2 = img[..., 2].mean()
-#     v0 = img[..., 0].var()
-#     v2 = img[..., 2].var()
-#     return float((c2 - c0) + 0.5 * (v2 - v0))
+        # 2. 추론 (Chunk 예측)
+        batch = {OBS_IMAGE: img_t, OBS_STATE: state_norm}
+        pred_chunk = self.policy.predict_action_chunk(batch)
+        action_real_chunk = self._unnormalize_action(pred_chunk.squeeze(0)).cpu().numpy()
 
+        # 3. Temporal Ensembling
+        curr_t = self.step_idx
+        if self.all_time_actions is None:
+            # 넉넉한 크기의 버퍼 생성 [최대스텝, 최대스텝+청크, 액션차원]
+            self.all_time_actions = np.zeros([20000, 20000 + CHUNK_SIZE, ACTION_DIM])
+        
+        self.all_time_actions[curr_t, curr_t : curr_t + CHUNK_SIZE] = action_real_chunk
+        
+        # 현재 시점(curr_t)에 겹치는 모든 과거의 예측값들을 수집
+        actions_for_curr_step = self.all_time_actions[: curr_t + 1, curr_t, :]
+        # 유효한(0이 아닌) 값만 필터링
+        actions_populated = actions_for_curr_step[np.any(actions_for_curr_step != 0, axis=1)]
+        
+        # 지수 가중치 적용
+        num_preds = len(actions_populated)
+        weights = np.exp(-self.k * np.arange(num_preds)[::-1])
+        weights = weights / weights.sum()
+        
+        combined_action = np.sum(actions_populated * weights[:, None], axis=0)
+        
+        self.step_idx += 1
+        return combined_action
 
-# def summarize_vec(name, X):
-#     X = np.asarray(X)
-#     if X.ndim == 1:
-#         X = X.reshape(-1, 1)
-#     mn = X.min(axis=0)
-#     mx = X.max(axis=0)
-#     mean = X.mean(axis=0)
-#     std = X.std(axis=0)
-#     p01 = np.quantile(X, 0.01, axis=0)
-#     p99 = np.quantile(X, 0.99, axis=0)
-#     print(f"\n[{name}] shape={X.shape}")
-#     print("  min :", np.round(mn, 5))
-#     print("  max :", np.round(mx, 5))
-#     print("  mean:", np.round(mean, 5))
-#     print("  std :", np.round(std, 5))
-#     print("  p01 :", np.round(p01, 5))
-#     print("  p99 :", np.round(p99, 5))
-#     return mn, mx
+# =========================================================
+# 3. 메인 함수
+# =========================================================
+def manual_raw_write(bus, motor_name, raw_value):
+    if motor_name not in bus.motors: return
+    motor = bus.motors[motor_name]
+    handler, table, _, _ = bus.get_target_info(motor.id)
+    addr, size = table["Goal_Position"]
+    raw_int = int(round(raw_value))
+    if size == 4:
+        handler.write4ByteTxRx(bus.port_handler, motor.id, addr, raw_int & 0xFFFFFFFF)
+    else:
+        handler.write2ByteTxRx(bus.port_handler, motor.id, addr, raw_int & 0xFFFF)
 
+def main():
+    inference = ACTInference(MODEL_PATH, device=DEVICE)
+    try:
+        robot = SimpleRobot(port="/dev/ttyUSB0", motor_ids=[10, 11, 12, 13, 14, 15], 
+                            robot_id="follower", is_leader=False, camera_type="realsense")
+        robot.connect(calibrate=False)
+        bus = robot.bus 
+        if hasattr(bus, 'enable_torque'): bus.enable_torque()
+    except Exception as e:
+        print(f"[Error] 로봇 연결 실패: {e}"); sys.exit(1)
 
-# def main():
-#     ap = argparse.ArgumentParser()
-#     ap.add_argument("--data_dir", type=str, required=True)
-#     ap.add_argument("--pattern", type=str, default="demo_*.pkl")
-#     ap.add_argument("--max_files", type=int, default=5)
-#     ap.add_argument("--max_steps", type=int, default=200)  # step list가 있으면 앞부분만
-#     ap.add_argument("--show", type=int, default=0)
-#     args = ap.parse_args()
+    print("\n[Start] Control Loop with Temporal Ensembling...")
+    try:
+        while True:
+            loop_start = time.time()
+            obs = robot.get_observation() 
+            if "camera" not in obs or obs["camera"] is None: continue
 
-#     paths = sorted(glob.glob(str(Path(args.data_dir) / args.pattern)))
-#     if len(paths) == 0:
-#         raise SystemExit("매칭되는 pkl이 없습니다. --data_dir/--pattern 확인")
+            current_joints = [obs[f"{name}.pos"] for name in JOINT_NAMES]
+            
+            # 앙상블된 액션 1개 받아오기
+            next_action = inference.step(obs["camera"], current_joints)
 
-#     paths = paths[: args.max_files]
-#     print(f"Found {len(paths)} files")
+            for i, name in enumerate(JOINT_NAMES):
+                raw_val = bus.denormalize(name, float(next_action[i]))
+                manual_raw_write(bus, name, raw_val)
 
-#     # 누적 통계용
-#     rgb_scores = []
-#     all_state = []
-#     all_action = []
+            elapsed = time.time() - loop_start
+            time.sleep(max(0, (1.0 / CONTROL_HZ) - elapsed))
+    except KeyboardInterrupt:
+        print("\n[Stop]")
+    finally:
+        robot.disconnect()
 
-#     # 탐색 결과(가장 그럴듯한 경로)
-#     img_paths = {}
-#     vec6_paths = {}
-
-#     for fp in paths:
-#         with open(fp, "rb") as f:
-#             obj = pickle.load(f)
-
-#         # 1) 우선 구조 스냅샷: 최상위 타입/키
-#         print(f"\n=== FILE: {fp} ===")
-#         print("Top type:", type(obj))
-#         if isinstance(obj, dict):
-#             print("Top keys:", list(obj.keys())[:30])
-#         elif isinstance(obj, list):
-#             print("Top list len:", len(obj))
-#             if len(obj) > 0:
-#                 print("First elem type:", type(obj[0]))
-#                 if isinstance(obj[0], dict):
-#                     print("First elem keys:", list(obj[0].keys())[:30])
-
-#         # 2) 전체 재귀 탐색(앞부분만)
-#         found_imgs = []
-#         found_vecs = []
-#         for path, val in walk(obj):
-#             if is_img_candidate(val):
-#                 found_imgs.append((path, val.shape, val.dtype))
-#                 img_paths[path] = img_paths.get(path, 0) + 1
-#             if is_vec_candidate(val, dim=6):
-#                 arr = np.asarray(val)
-#                 found_vecs.append((path, arr.shape, arr.dtype))
-#                 vec6_paths[path] = vec6_paths.get(path, 0) + 1
-
-#         print("\n[Candidates] image uint8(H,W,3):")
-#         for x in found_imgs[:10]:
-#             print(" ", x)
-#         print("[Candidates] vector dim=6:")
-#         for x in found_vecs[:20]:
-#             print(" ", x)
-
-#         # 3) 후보가 있으면 실제 진단 샘플링
-#         #    - 이미지: 가장 먼저 나온 후보 1개
-#         if len(found_imgs) > 0:
-#             p = found_imgs[0][0]
-#             img = get_by_path(obj, p)
-#             rgb_scores.append(rgb_bgr_score(img))
-#             if args.show == 1 and cv2 is not None:
-#                 cv2.imshow("raw", img)
-#                 cv2.imshow("swap", img[:, :, ::-1])
-#                 cv2.waitKey(500)
-
-#         #    - vec6: 후보가 여러 개인데, state/action 구분을 위해 키 이름 기반 우선순위 부여
-#         #      action 단어가 들어간 path를 action으로, qpos/state/joint가 들어간 path를 state로 우선
-#         state_candidates = [p for (p, *_rest) in found_vecs if any(k in p.lower() for k in ["qpos", "state", "joint", "pos"])]
-#         action_candidates = [p for (p, *_rest) in found_vecs if any(k in p.lower() for k in ["action", "act", "u", "cmd"])]
-
-#         # fallback: 그냥 vec6 첫 번째를 state로 간주
-#         if len(state_candidates) == 0 and len(found_vecs) > 0:
-#             state_candidates = [found_vecs[0][0]]
-
-#         # action fallback: state와 다른 vec6가 있으면 그걸 action으로
-#         if len(action_candidates) == 0 and len(found_vecs) > 1:
-#             action_candidates = [found_vecs[1][0]]
-
-#         if len(state_candidates) > 0:
-#             st = np.asarray(get_by_path(obj, state_candidates[0])).astype(np.float32)
-#             st = st.reshape(-1, 6) if st.ndim == 2 else st.reshape(1, 6)
-#             all_state.append(st)
-
-#         if len(action_candidates) > 0:
-#             ac = np.asarray(get_by_path(obj, action_candidates[0])).astype(np.float32)
-#             ac = ac.reshape(-1, 6) if ac.ndim == 2 else ac.reshape(1, 6)
-#             all_action.append(ac)
-
-#     if args.show == 1 and cv2 is not None:
-#         cv2.destroyAllWindows()
-
-#     print("\n" + "=" * 60)
-#     print("AGGREGATED DIAG RESULTS")
-#     print("=" * 60)
-
-#     # 1) RGB/BGR
-#     if len(rgb_scores) > 0:
-#         med = float(np.median(np.array(rgb_scores)))
-#         print("\n[Color Channel Guess]")
-#         print(f"  median score = {med:.6f}  ( >0: RGB likely, <0: BGR likely )")
-#         if med > 0:
-#             print("  -> 데이터 이미지가 RGB일 가능성이 큼. deploy에서 BGR이면 RGB 변환 필요.")
-#         else:
-#             print("  -> 데이터 이미지가 BGR(OpenCV)일 가능성이 큼. deploy 입력 채널 확인 필요.")
-#     else:
-#         print("\n[Color Channel Guess] 이미지 후보를 못 찾았습니다. (이미지가 uint8이 아닐 수도 있음)")
-
-#     # 2) state/action 범위
-#     if len(all_state) > 0:
-#         st = np.concatenate(all_state, axis=0)
-#         st_min, st_max = summarize_vec("STATE(guessed)", st)
-#     else:
-#         st = None
-#         print("\n[STATE] 후보를 못 잡았습니다.")
-
-#     if len(all_action) > 0:
-#         ac = np.concatenate(all_action, axis=0)
-#         ac_min, ac_max = summarize_vec("ACTION(guessed)", ac)
-#     else:
-#         ac = None
-#         print("\n[ACTION] 후보를 못 잡았습니다.")
-
-#     if st is not None and ac is not None:
-#         st_rng = st_max - st_min
-#         ac_rng = ac_max - ac_min
-#         ratio = np.where(st_rng > 1e-6, ac_rng / st_rng, np.nan)
-#         print("\n[State vs Action Range ratio(action/state)]", np.round(ratio, 4))
-
-#         bad = np.sum((ratio < 0.2) | (ratio > 5.0))
-#         if bad >= 2:
-#             print("  -> 판정: action과 state 스케일 차이가 큼. state stats로 action 정규화하면 출력이 평균으로 수렴하기 쉬움.")
-#         else:
-#             print("  -> 판정: 스케일 차이가 치명적이진 않아 보임.")
-
-#     # 3) 어떤 경로가 자주 나왔는지(포맷 확정용)
-#     print("\n[Most frequent image paths]")
-#     for p, c in sorted(img_paths.items(), key=lambda x: -x[1])[:10]:
-#         print(f"  {c}x  {p}")
-
-#     print("\n[Most frequent vec6 paths]")
-#     for p, c in sorted(vec6_paths.items(), key=lambda x: -x[1])[:15]:
-#         print(f"  {c}x  {p}")
-
-
-# if __name__ == "__main__":
-#     main()
-import pickle, glob, numpy as np
-p = sorted(glob.glob("/home/lmh/minimal_lerobot/examples/data/demo_*.pkl"))[0]
-d = pickle.load(open(p,"rb"))
-a0 = d["actions"][0]
-v = np.array([a0[k] for k in ['shoulder_pan.pos','shoulder_lift.pos','elbow_flex.pos','wrist_flex.pos','wrist_roll.pos','gripper.pos']], dtype=float)
-print("first action vec:", v)
-print("action min/max (first 200):")
-A=[]
-for i in range(min(200,len(d["actions"]))):
-    ai=d["actions"][i]
-    A.append([ai[k] for k in a0.keys()])
-A=np.array(A,float)
-print("min:", A.min(axis=0))
-print("max:", A.max(axis=0))
+if __name__ == "__main__":
+    main()
