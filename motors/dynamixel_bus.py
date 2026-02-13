@@ -105,8 +105,6 @@ class DynamixelMotorsBus:
         """토크 활성화 및 하드웨어 속도 제한 설정"""
         
         # [속도 조절] 
-        # 0: 무제한 (진동 발생함)
-        # 130: 추천값 (적당히 빠르고 부드러움)
         SPEED_LIMIT_VAL_AX = 100 
         SPEED_LIMIT_VAL_XL = 200
 
@@ -114,15 +112,17 @@ class DynamixelMotorsBus:
         
         for name in target:
             motor = self.motors[name]
+            # get_target_info가 이미 모델명(XL/XM/AX)을 보고 올바른 handler와 table을 줍니다.
             handler, table, _, _ = self.get_target_info(motor.id)
 
             try:
-                if motor.protocol == 1.0:
-                    # AX-12A (Protocol 1.0): 2바이트 명령 사용
+                # ★ 수정됨: motor.protocol 대신 handler 객체를 직접 비교합니다.
+                if handler == self.packet_handler_1:
+                    # AX-12A (Protocol 1.0)
                     addr_spd, size_spd = table.get("Moving_Speed", (32, 2))
                     handler.write2ByteTxRx(self.port_handler, motor.id, addr_spd, SPEED_LIMIT_VAL_AX)
                 else:
-                    # XL/XM (Protocol 2.0): 4바이트 명령 사용
+                    # XL/XM (Protocol 2.0)
                     addr_spd, size_spd = table.get("Profile_Velocity", (112, 4))
                     handler.write4ByteTxRx(self.port_handler, motor.id, addr_spd, SPEED_LIMIT_VAL_XL)
             except Exception as e:

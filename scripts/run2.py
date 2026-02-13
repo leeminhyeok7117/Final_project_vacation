@@ -221,149 +221,45 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ACT + RealSense(SimpleRobot) PKL 기반 추론 실행 코드
-기능:
-1) RealSense 카메라 대신 .pkl 파일에 저장된 데이터(Image, State)를 순차적으로 로드
-2) 모델(ACT)에 데이터를 입력하여 다음 Action 추론
-3) 추론된 Action을 실제 연결된 로봇(Follower)에게 전송
-"""
-
 import sys
 import time
 import argparse
 import pickle
-from pathlib import Path
-from collections import deque
-
+import traceback
 import numpy as np
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 from torchvision import transforms
-current_file = Path(__file__).resolve()
-project_root = current_file.parent.parent  # scripts의 상위 디렉토리
 
+# 경로 설정
+current_file = Path(__file__).resolve()
+project_root = current_file.parent.parent 
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
-# 로봇 및 정책 임포트
+
 from robots import SimpleRobot
 
 try:
     from policy.act_vision_policy import ACTVisionPolicy, OBS_IMAGE, OBS_STATE
 except ImportError as e:
-    print(f"[Error] policy 폴더 내 act_vision_policy.py를 찾을 수 없습니다: {e}")
+    print(f"[Error] act_vision_policy.py를 찾을 수 없습니다: {e}")
     sys.exit(1)
 
 # =========================================================
-# 유틸: 로봇 raw write (Goal_Position 직접 쓰기)
+# 유틸리티 함수
 # =========================================================
 def manual_raw_write(bus, motor_name, raw_value):
-    if motor_name not in bus.motors:
-        return
+    if motor_name not in bus.motors: return
     motor = bus.motors[motor_name]
     handler, table, _, _ = bus.get_target_info(motor.id)
     addr, size = table["Goal_Position"]
-
-    raw_int = int(raw_value)
+    raw_int = int(round(raw_value))
     if size == 4:
         handler.write4ByteTxRx(bus.port_handler, motor.id, addr, raw_int & 0xFFFFFFFF)
     else:
         handler.write2ByteTxRx(bus.port_handler, motor.id, addr, raw_int & 0xFFFF)
 
-# =========================================================
-# 추론 클래스
-# =========================================================
-class ACTInference:
-    def __init__(
-        self,
-        checkpoint_path: Path,
-        joint_names,
-        device: torch.device,
-        chunk_size: int = 8,
-        camera_is_rgb: bool = False,
-    ):
-        self.device = device
-        self.joint_names = joint_names
-        self.chunk_size = chunk_size
-        self.camera_is_rgb = camera_is_rgb
-
-        print(f"[INFO] 체크포인트 로드 중: {checkpoint_path}")
-        ckpt = torch.load(str(checkpoint_path), map_location="cpu")
-
-        cfg = ckpt.get("config", {})
-        state_dim = int(cfg.get("state_dim", 6))
-        action_dim = int(cfg.get("action_dim", 6))
-        d_model = int(cfg.get("dim_model", 512))
-        n_action_steps = int(cfg.get("n_action_steps", self.chunk_size))
-        chunk_size = int(cfg.get("chunk_size", self.chunk_size))
-
-        self.policy = ACTVisionPolicy(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            chunk_size=chunk_size,
-            n_action_steps=n_action_steps,
-            d_model=d_model,
-        ).to(self.device)
-
-        state_dict = ckpt["model_state_dict"]
-        self.policy.load_state_dict(state_dict, strict=False)
-        self.policy.eval()
-        self.policy.reset()
-
-        self.stats = ckpt.get("stats", {})
-        for k in ["min", "max", "mean", "std", "qpos_mean", "qpos_std"]:
-            if k in self.stats and not isinstance(self.stats[k], torch.Tensor):
-                self.stats[k] = torch.tensor(self.stats[k], dtype=torch.float32)
-
-        self.use_min_max = ("min" in self.stats) and ("max" in self.stats)
-        if not self.use_min_max and ("qpos_mean" in self.stats) and ("qpos_std" in self.stats):
-            self.stats["mean"] = self.stats["qpos_mean"]
-            self.stats["std"] = self.stats["qpos_std"]
-
-        self.img_transform = transforms.Compose([
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-
-    def _normalize_state(self, state_1d: torch.Tensor) -> torch.Tensor:
-        if self.use_min_max:
-            s_min = self.stats["min"].to(self.device)
-            s_max = self.stats["max"].to(self.device)
-            return 2.0 * (state_1d - s_min) / (s_max - s_min + 1e-5) - 1.0
-        mean = self.stats["mean"].to(self.device)
-        std = self.stats["std"].to(self.device)
-        return (state_1d - mean) / (std + 1e-8)
-
-    def _unnormalize_action(self, action_norm_1d: torch.Tensor) -> torch.Tensor:
-        if self.use_min_max:
-            a_min = self.stats["min"].to(self.device)
-            a_max = self.stats["max"].to(self.device)
-            return (action_norm_1d + 1.0) * (a_max - a_min) / 2.0 + a_min
-        mean = self.stats["mean"].to(self.device)
-        std = self.stats["std"].to(self.device)
-        return action_norm_1d * std + mean
-
-    @torch.no_grad()
-    def step(self, image_np: np.ndarray, obs_dict: dict) -> np.ndarray:
-        img = image_np.copy()
-        if self.camera_is_rgb:
-            img = img[:, :, ::-1].copy() # RGB to BGR swap
-
-        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
-        img_t = F.interpolate(img_t.unsqueeze(0), size=(128, 128), mode="bilinear").squeeze(0)
-        img_t = self.img_transform(img_t).unsqueeze(0).to(self.device)
-
-        state_vec = np.array([obs_dict[f"{n}.pos"] for n in self.joint_names], dtype=np.float32)
-        state_t = torch.from_numpy(state_vec).to(self.device)
-        state_norm = self._normalize_state(state_t).unsqueeze(0)
-
-        batch = {OBS_IMAGE: img_t, OBS_STATE: state_norm}
-        action_norm = self.policy.select_action(batch).squeeze(0)
-        action_real = self._unnormalize_action(action_norm)
-        return action_real.detach().cpu().numpy()
-
-# =========================================================
-# 자동 모드 판정
-# =========================================================
 def decide_write_mode(bus, joint_names, obs, probe_actions=None):
     diffs = []
     rt_ok = 0
@@ -378,55 +274,112 @@ def decide_write_mode(bus, joint_names, obs, probe_actions=None):
             diffs.append(diff)
             if diff < 1e-2: rt_ok += 1
         except: continue
-    
     ok_ratio = rt_ok / len(diffs) if diffs else 0
     if ok_ratio >= 0.8: return "B"
-    
-    if probe_actions is not None:
-        a = np.array(probe_actions)
-        frac = np.abs(a - np.round(a))
-        if np.median(frac) < 0.05: return "A"
     return "B"
+
+# =========================================================
+# 추론 클래스
+# =========================================================
+class ACTInference:
+    def __init__(self, checkpoint_path, joint_names, device, camera_is_rgb=False):
+        self.device = device
+        self.joint_names = joint_names
+        self.camera_is_rgb = camera_is_rgb
+        
+        print(f"[INFO] 체크포인트 로드 중: {checkpoint_path}")
+        ckpt = torch.load(str(checkpoint_path), map_location=device)
+        
+        cfg = ckpt.get("config", {})
+        state_dim = 6
+        action_dim = 6
+        chunk_size = 8
+        d_model = 512
+
+        self.policy = ACTVisionPolicy(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            chunk_size=chunk_size,
+            n_action_steps=chunk_size,
+            d_model=d_model,
+        ).to(self.device)
+
+        state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt["model"]
+        self.policy.load_state_dict(state_dict, strict=False)
+        self.policy.eval()
+
+        self.stats = ckpt.get("stats", {})
+        self.use_min_max = "min" in self.stats
+        
+        self.img_transform = transforms.Compose([
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+
+    def _normalize_state(self, state_t):
+        if self.use_min_max:
+            s_min, s_max = self.stats["min"].to(self.device), self.stats["max"].to(self.device)
+            return 2.0 * (state_t - s_min) / (s_max - s_min + 1e-5) - 1.0
+        elif "qpos_mean" in self.stats:
+            mean, std = self.stats["qpos_mean"].to(self.device), self.stats["qpos_std"].to(self.device)
+            return (state_t - mean) / (std + 1e-8)
+        return state_t
+
+    def _unnormalize_action(self, action_norm_t):
+        if self.use_min_max:
+            a_min, a_max = self.stats["min"].to(self.device), self.stats["max"].to(self.device)
+            return (action_norm_t + 1.0) * (a_max - a_min) / 2.0 + a_min
+        elif "qpos_mean" in self.stats:
+            mean, std = self.stats["qpos_mean"].to(self.device), self.stats["qpos_std"].to(self.device)
+            return action_norm_t * std + mean
+        return action_norm_t
+
+    @torch.no_grad()
+    def step(self, image_np, obs_dict):
+        img = image_np.copy()
+        if self.camera_is_rgb: img = img[:, :, ::-1].copy()
+
+        img_t = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        img_t = F.interpolate(img_t.unsqueeze(0), size=(128, 128), mode="bilinear").squeeze(0)
+        img_t = self.img_transform(img_t).unsqueeze(0).to(self.device)
+
+        state_vec = np.array([obs_dict[f"{n}.pos"] for n in self.joint_names], dtype=np.float32)
+        state_norm = self._normalize_state(torch.from_numpy(state_vec).to(self.device)).unsqueeze(0)
+
+        batch = {OBS_IMAGE: img_t, OBS_STATE: state_norm}
+        action_norm = self.policy.predict_action_chunk(batch)[:, 0, :] 
+        action_real = self._unnormalize_action(action_norm.squeeze(0))
+        return action_real.cpu().numpy()
 
 # =========================================================
 # 메인 실행부
 # =========================================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ckpt", type=str, required=True, help="체크포인트(.pth) 경로")
-    parser.add_argument("--pkl", type=str, required=True, help="추론에 사용할 데이터(.pkl) 경로")
+    parser.add_argument("--ckpt", type=str, required=True)
+    parser.add_argument("--pkl", type=str, required=True)
     parser.add_argument("--control_hz", type=float, default=30.0)
     parser.add_argument("--camera_is_rgb", action="store_true")
     args = parser.parse_args()
 
-    # 1. pkl 데이터 로드
     print(f"[INFO] PKL 로딩 중: {args.pkl}")
     with open(args.pkl, 'rb') as f:
-        demo_data = pickle.load(f)
+        raw_data = pickle.load(f)
     
-    # 2. 모델 및 로봇 초기화
+    # 딕셔너리 구조에서 데이터 리스트 추출
+    if isinstance(raw_data, dict) and 'observations' in raw_data:
+        demo_data = raw_data['observations']
+    else:
+        demo_data = raw_data
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     joint_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
     
-    inference = ACTInference(
-        checkpoint_path=Path(args.ckpt),
-        joint_names=joint_names,
-        device=device,
-        camera_is_rgb=args.camera_is_rgb
-    )
+    inference = ACTInference(Path(args.ckpt), joint_names, device, args.camera_is_rgb)
 
     try:
-        robot = SimpleRobot(
-            port="/dev/ttyUSB0",
-            motor_ids=[10, 11, 12, 13, 14, 15],
-            robot_id="follower",
-            is_leader=False,
-            camera_index=0,
-            camera_type="realsense",
-        )
+        robot = SimpleRobot(port="/dev/ttyUSB0", motor_ids=[10,11,12,13,14,15], robot_id="follower", is_leader=False)
         robot.connect(calibrate=False)
-        bus = robot.bus
-        if hasattr(bus, "enable_torque"): bus.enable_torque()
+        if hasattr(robot.bus, "enable_torque"): robot.bus.enable_torque()
         print("[INFO] Robot Connected")
     except Exception as e:
         print(f"[Error] 로봇 연결 실패: {e}"); sys.exit(1)
@@ -434,57 +387,51 @@ def main():
     mode = None
     action_probe = []
 
-    print("\n[Start] PKL Playback Control... (Press CTRL+C to stop)")
+    print("\n[Start] PKL Playback Control...")
     try:
-        # pkl 시퀀스 루프
-        for i, data_source in enumerate(demo_data):
+        for i, step_data in enumerate(demo_data):
+            if isinstance(step_data, str): continue # "observations" 같은 키값 건너뜀
+            
             start_time = time.time()
 
-            # --- 수정된 부분: data_source가 문자열(경로)일 경우 로드 ---
-            if isinstance(data_source, str):
-                # 상대 경로일 수 있으므로 pkl 파일이 포함된 폴더 기준으로 경로 설정
-                pkl_dir = Path(args.pkl).parent
-                with open(pkl_dir / data_source, 'rb') as f:
-                    step_data = pickle.load(f)
-            else:
-                step_data = data_source
-            # -------------------------------------------------------
-
-            # 데이터셋 구조에 따라 키값 추출
-            img = step_data.get('observation.images.camera') or step_data.get('camera')
-            raw_state = step_data.get('observation.state') or step_data.get('qpos')
+            # --- ValueError 해결: 배열 safe 추출 ---
+            img = step_data.get('camera')
+            if img is None:
+                img = step_data.get('observation.images.camera')
             
+            # 상태 추출
+            raw_state = None
+            if 'shoulder_pan.pos' in step_data:
+                raw_state = [step_data[f"{n}.pos"] for n in joint_names]
+            else:
+                raw_state = step_data.get('qpos')
+                if raw_state is None: raw_state = step_data.get('observation.state')
+
             if img is None or raw_state is None:
-                print(f"\n[Skip] Step {i}: 데이터 누락"); continue
+                continue
 
             obs_dict = {f"{name}.pos": raw_state[idx] for idx, name in enumerate(joint_names)}
-
-            # 추론
             action = inference.step(img, obs_dict)
 
-            # 모드 판정 (최초 10스텝)
             if mode is None:
                 action_probe.append(action)
-                if len(action_probe) >= 10:
-                    mode = decide_write_mode(bus, joint_names, obs_dict, action_probe)
+                if len(action_probe) >= 5:
+                    mode = decide_write_mode(robot.bus, joint_names, obs_dict)
                     print(f"\n[Decision] Write Mode: {mode}")
 
-            # 로봇 실행
-            debug_raw = []
+            # 실행
             for j, name in enumerate(joint_names):
                 val = float(action[j])
-                raw_val = int(round(val)) if mode == "A" else int(round(bus.denormalize(name, val)))
-                debug_raw.append(raw_val)
-                manual_raw_write(bus, name, raw_val)
+                raw_val = robot.bus.denormalize(name, val) if mode == "B" else val
+                manual_raw_write(robot.bus, name, raw_val)
 
-            print(f"\r[Step {i:4d}] Mode: {mode or '?'} | Raw: {debug_raw}", end="")
-
-            # 주기 맞춤
-            elapsed = time.time() - start_time
-            time.sleep(max(0, (1.0 / args.control_hz) - elapsed))
+            print(f"\r[Step {i:4d}] Action sent...", end="", flush=True)
+            time.sleep(max(0, (1.0 / args.control_hz) - (time.time() - start_time)))
 
     except KeyboardInterrupt:
-        print("\n[Stop] User Interrupted")
+        print("\n[Stop] Stopped by user.")
+    except Exception:
+        traceback.print_exc()
     finally:
         robot.disconnect()
 

@@ -156,7 +156,7 @@ GEAR_RATIOS = {1: 2.0, 11: 2.0}
 # =========================================================
 # PKL 설정
 # =========================================================
-PKL_PATH = "/home/lmh/minimal_lerobot/examples/data/demo_20260130_141251_2.pkl"  # TODO: 실제 pkl 경로로 변경
+PKL_PATH = "/home/lmh/minimal_lerobot/examples/data/demo_20260130_142757_19.pkl"  # TODO: 실제 pkl 경로로 변경
 
 
 def load_action_frames_from_pkl(pkl_path: str, joint_names: list) -> np.ndarray:
